@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How the Clouds Work — MyLittlePlanet</title>
+<link rel="stylesheet" href="css/blog_style.css">
+</head>
+<body>
+
+<a class="back-link" href="index.html">&larr; Back to the Planet</a>
+
+<h1>How the Clouds Work</h1>
+<p class="subtitle">Raymarching a spherical shell, Beer-Lambert extinction, and the Henyey-Greenstein phase function</p>
+
+<nav>
+  <strong>Contents</strong>
+  <a href="#why">1. Why Volumetric?</a>
+  <a href="#shell">2. The Spherical Shell</a>
+  <a href="#density">3. The Density Field</a>
+  <a href="#march">4. Raymarching</a>
+  <a href="#beer">5. Beer-Lambert Extinction</a>
+  <a href="#light">6. Lightmarching</a>
+  <a href="#phase">7. Henyey-Greenstein Scattering</a>
+  <a href="#ray">8. Ray Reconstruction</a>
+  <a href="#pass">9. Render Pass</a>
+  <a href="#perf">10. Performance Decisions</a>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 1: WHY VOLUMETRIC
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="why">1. Why Volumetric Clouds?</h2>
+
+<p>
+The planet uses vertex displacement to shape its terrain: every point on the mesh is
+pushed outward by a noise value, creating mountains and valleys as actual geometry.
+Clouds cannot work this way. A cloud is not a surface — it is a diffuse mass of
+ice crystals and water droplets that light can partially penetrate, scatter through,
+and exit on a different path. Its opacity varies continuously from wispy edges to
+dense core, and it has no sharp boundary.
+</p>
+
+<p>
+Two common shortcuts exist in real-time rendering. The first is a <strong>billboard</strong>:
+a flat, textured quad that always faces the camera. Billboards work for isolated distant
+clouds but collapse into flat cards when viewed from the side. The second is a
+<strong>shell texture</strong>: a spherical mesh with a cloud image painted on it.
+This looks like a rigid shell rather than a floating volume, and it cannot cast self-shadows
+or interact with light in a physically meaningful way.
+</p>
+
+<p>
+<strong>Volumetric raymarching</strong> avoids both shortcuts. The fragment shader traces a ray
+from the camera through the cloud volume, sampling density at equally-spaced intervals.
+At each sample it accumulates how much light is scattered toward the camera and how much
+is absorbed. The result is a physically-motivated image where clouds thin at their edges,
+cast shadows on themselves, and glow around the sun.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 2: THE SPHERICAL SHELL
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="shell">2. The Spherical Shell</h2>
+
+<p>
+The cloud layer is a <strong>spherical shell</strong> — the region between two concentric spheres
+centred on the planet. The inner radius sits just above the highest terrain peak
+(planet radius + maximum noise displacement + a small gap to prevent interpenetration).
+The outer radius is the inner radius plus the cloud height:
+</p>
+
+<span class="eq">
+  <i>r</i><sub>inner</sub> = <i>r</i><sub>planet</sub> + <i>A</i><sub>noise</sub> + 0.02
+  &nbsp;&nbsp;
+  <i>r</i><sub>outer</sub> = <i>r</i><sub>inner</sub> + <i>h</i><sub>cloud</sub>
+</span>
+
+<p>
+Both radiuses are recomputed every frame. When the user raises the
+planet radius or the noise amplitude, the cloud shell rises automatically.
+</p>
+
+<h3>Ray-sphere intersection</h3>
+
+<p>
+Given a ray <span style="font-style:italic">ro + t·rd</span> (origin + normalized direction),
+a point lies on a sphere of radius <em>r</em> when:
+</p>
+
+<span class="eq">|<i>ro</i> + <i>t</i>·<i>rd</i>|² = <i>r</i>²</span>
+
+<p>Expanding (using |<em>rd</em>|² = 1 since <em>rd</em> is normalized) gives a quadratic in <em>t</em>:</p>
+
+<span class="eq">
+  <i>t</i>² + 2<i>b</i>·<i>t</i> + <i>c</i> = 0
+  &nbsp;&nbsp; where &nbsp;&nbsp;
+  <i>b</i> = <i>ro</i>·<i>rd</i>, &nbsp; <i>c</i> = |<i>ro</i>|² - <i>r</i>²
+</span>
+
+<p>
+The half-discriminant form avoids an explicit factor of 2 in the denominator.
+Two solutions exist when <em>b</em>² - <em>c</em> > 0; the smaller root is the entry
+point, the larger is the exit point:
+</p>
+
+<pre><code><span class="kw">vec2</span> <span class="fn">raySphereIntersect</span>(<span class="kw">vec3</span> ro, <span class="kw">vec3</span> rd, <span class="kw">float</span> r) {
+  <span class="kw">float</span> b    = <span class="fn">dot</span>(ro, rd);
+  <span class="kw">float</span> c    = <span class="fn">dot</span>(ro, ro) - r * r;
+  <span class="kw">float</span> disc = b*b - c;
+  <span class="kw">if</span> (disc < <span class="nm">0.0</span>) <span class="kw">return</span> <span class="fn">vec2</span>(-<span class="nm">1.0</span>);   <span class="cm">// miss</span>
+  <span class="kw">float</span> sq = <span class="fn">sqrt</span>(disc);
+  <span class="kw">return</span> <span class="fn">vec2</span>(-b - sq, -b + sq);
+}</code></pre>
+
+<h3>Clipping the march to the shell</h3>
+
+<p>
+With two sphere tests we derive the exact interval of <em>t</em> values
+that lies within the cloud shell. The camera is always outside both spheres,
+so the outer sphere gives an entry and exit, while the inner sphere (if hit)
+gives the point where the ray would enter the planet — which is where cloud
+marching must stop:
+</p>
+
+<pre><code><span class="kw">bool</span> <span class="fn">raySphereShellIntersect</span>(<span class="kw">vec3</span> ro, <span class="kw">vec3</span> rd,
+                              <span class="kw">float</span> rInner, <span class="kw">float</span> rOuter,
+                              <span class="kw">out float</span> tEnter, <span class="kw">out float</span> tExit) {
+  <span class="kw">vec2</span> outer = <span class="fn">raySphereIntersect</span>(ro, rd, rOuter);
+  <span class="kw">if</span> (outer.y < <span class="nm">0.0</span>) <span class="kw">return false</span>;      <span class="cm">// misses cloud layer entirely</span>
+
+  <span class="kw">vec2</span> inner = <span class="fn">raySphereIntersect</span>(ro, rd, rInner);
+  tEnter = <span class="fn">max</span>(outer.x, <span class="nm">0.0</span>);            <span class="cm">// clamp to camera position</span>
+  tExit  = (inner.x > <span class="nm">0.0</span>) ? inner.x : outer.y;
+  <span class="kw">return</span> tExit > tEnter;
+}</code></pre>
+
+<p>
+When <code>inner.x > 0</code> the ray is heading toward the planet. Setting
+<code>tExit = inner.x</code> means the march stops exactly at the planet surface —
+no depth buffer read required. Planet occlusion is handled purely in math.
+</p>
+
+<div class="note">
+<strong>Geometry, not depth buffer:</strong> WebGL 1.0 cannot read from the depth buffer without the
+<code>WEBGL_depth_texture</code> extension, which is not universally available.
+The inner-sphere intersection gives us the same answer — the point where
+the cloud ray would hit the opaque planet — without any texture access.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 3: DENSITY FIELD
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="density">3. The Density Field</h2>
+
+<p>
+Inside the shell, every point in 3D space has a <strong>density</strong> — a non-negative scalar
+that represents how thick the cloud is at that location. Density zero is clear air;
+density one is the thickest possible cloud. The density field is entirely procedural:
+no textures are involved.
+</p>
+
+<h3>3D FBM in world space</h3>
+
+<p>
+The density is derived from Fractional Brownian Motion (FBM) evaluated at the
+<em>world-space 3D position</em> of the sample point. Using world space is what makes the clouds volumetric — two rays that cross the same
+physical location in the shell see the same density, even if they arrive from
+different camera angles.
+</p>
+
+<p>
+The FBM sums 6 octaves of value noise at baked-in constants (lacunarity = 2, gain = 0.5):
+</p>
+
+<pre><code><span class="kw">float</span> <span class="fn">fbm</span>(<span class="kw">vec3</span> p) {
+  <span class="kw">float</span> val=<span class="nm">0.</span>, amp=<span class="nm">0.5</span>, freq=<span class="nm">1.</span>, norm=<span class="nm">0.</span>;
+  <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nm">0</span>; i < <span class="nm">6</span>; i++) {
+    val  += amp * <span class="fn">valueNoise</span>(p * freq);
+    norm += amp;
+    freq *= <span class="nm">2.0</span>;
+    amp  *= <span class="nm">0.5</span>;
+  }
+  <span class="kw">return</span> val / norm;   <span class="cm">// normalized to [-1, 1]</span>
+}</code></pre>
+
+<p>
+This is the same value noise and FBM used in the planet's vertex shader.
+For cloud self-shadowing, a cheaper 3-octave variant (<code>fbmFast</code>) is used —
+the coarser approximation is sufficient for shadow estimation.
+</p>
+
+<h3>Coverage threshold</h3>
+
+<p>
+Raw FBM noise is symmetric around zero: half the domain is positive, half negative.
+The <code>u_coverage</code> slider shifts a threshold that determines how much of that
+distribution counts as cloud. With threshold <em>τ</em> = 1 - coverage:
+</p>
+
+<span class="eq">
+  density(<i>p</i>) = max(0, &nbsp; FBM(<i>p</i>) - <i>τ</i>) · <i>u</i><sub>density</sub> · falloff(<i>h</i>)
+</span>
+
+<p>
+At coverage 0.45, the threshold is 0.55: only the top 22% of the FBM distribution
+produces cloud, yielding scattered cumulus. At coverage 0.8, the threshold is 0.2:
+60% of the domain is cloud, producing a dense overcast layer.
+</p>
+
+<h3>Height falloff</h3>
+
+<p>
+A uniform shell of identical density would look like a thick, flat fog band. Real clouds
+are denser in the middle of the layer and fade toward both boundaries.
+The normalized height within the shell is:
+</p>
+
+<span class="eq">
+  <i>h</i> = (|<i>p</i>| - <i>r</i><sub>inner</sub>) / (<i>r</i><sub>outer</sub> - <i>r</i><sub>inner</sub>)
+  &nbsp;&nbsp; ∈ [0, 1]
+</span>
+
+<p>
+The falloff multiplier uses two opposing smoothstep curves — one fading in from the
+inner edge and one fading out at the outer edge:
+</p>
+
+<pre><code><span class="kw">float</span> falloff = <span class="fn">smoothstep</span>(<span class="nm">0.0</span>, <span class="nm">0.15</span>, h)   <span class="cm">// ramp up from inner edge</span>
+              * <span class="fn">smoothstep</span>(<span class="nm">1.0</span>, <span class="nm">0.85</span>, h);  <span class="cm">// ramp down at outer edge</span></code></pre>
+
+<p>
+The 0.15 and 0.85 thresholds mean the top and bottom 15% of the shell fade to zero.
+The flattest, most opaque clouds sit in the middle third of the shell.
+</p>
+
+<h3>Cloud animation</h3>
+
+<p>
+The sample position is shifted by a time-varying scroll vector before FBM is evaluated,
+creating steady drift:
+</p>
+
+<pre><code><span class="kw">vec3</span> scroll = <span class="kw">vec3</span>(u_time * u_cloudSpeed,  <span class="nm">0.0</span>,
+                    u_time * u_cloudSpeed * <span class="nm">0.7</span>);
+<span class="kw">float</span> noise = <span class="fn">fbm</span>((p + scroll) * u_cloudFreq);</code></pre>
+
+<p>
+Using different scroll rates in X and Z (1.0 and 0.7) breaks the symmetry —
+clouds drift diagonally, more naturally than a purely horizontal scroll.
+The Y axis is left fixed (no vertical drift, as in real tropospheric clouds).
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 4: RAYMARCHING
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="march">4. Raymarching — Walking Through the Volume</h2>
+
+<p>
+Between the entry point <em>t</em><sub>enter</sub> and exit point <em>t</em><sub>exit</sub>,
+the shader takes 64 equally-spaced steps along the ray, sampling the density at each one.
+The step size is:
+</p>
+
+<span class="eq">
+  Δ<i>t</i> = (<i>t</i><sub>exit</sub> - <i>t</i><sub>enter</sub>) / 64
+</span>
+
+<p>
+With a default cloud height of 0.12 world units, Δ<em>t</em> ≈ 0.002. Each sample is at
+position <em>p</em> = <em>ro</em> + <em>t</em> · <em>rd</em>.
+</p>
+
+<h3>Jittered start — eliminating banding</h3>
+
+<p>
+Fixed equal steps produce visible concentric rings ("banding") where empty steps
+and dense steps fall on a regular grid that coincidentally aligns with the shell geometry.
+The fix is to offset the starting position by a random fraction of one step:
+</p>
+
+<pre><code><span class="kw">float</span> jitter = <span class="fn">hash3</span>(<span class="kw">vec3</span>(gl_FragCoord.xy, u_time)) * stepSz;</code></pre>
+
+<p>
+<code>hash3</code> is the Dave Hoskins hash function that also appears in the planet's vertex shader.
+Using <code>gl_FragCoord.xy</code> (pixel coordinates, unique per fragment) and
+<code>u_time</code> (changing each frame) produces a different offset for every pixel
+every frame. Temporally the pattern appears as high-frequency noise, which is perceptually
+far less distracting than coherent banding rings.
+</p>
+
+<h3>Early termination</h3>
+
+<p>
+Two conditions allow the loop to stop before completing all 64 steps:
+</p>
+
+<pre><code><span class="kw">if</span> (t >= tExit || T < <span class="nm">0.01</span>) <span class="kw">break</span>;
+<span class="cm">// ...</span>
+<span class="kw">if</span> (<span class="fn">length</span>(p) < u_cloudInner) <span class="kw">break</span>; <span class="cm">// planet surface</span></code></pre>
+
+<p>
+The transmittance threshold <code>T &lt; 0.01</code> exits when the accumulated cloud is
+99% opaque — further samples cannot contribute more than 1% to the final colour.
+The inner-sphere check catches any floating-point imprecision that places a step
+slightly inside the planet despite the shell clipping computed earlier.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 5: BEER-LAMBERT EXTINCTION
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="beer">5. Beer-Lambert Extinction</h2>
+
+<p>
+As light travels through a participating medium, it is absorbed and scattered out of
+the beam. The <strong>Beer-Lambert law</strong> describes the fraction of light that
+survives after travelling distance <em>d</em> through a medium with extinction coefficient alpha:
+</p>
+
+<span class="eq">
+  <i>T</i> = e<sup>-alpha · <i>d</i></sup>
+</span>
+
+<p>
+<em>T</em> is the <strong>transmittance</strong>: the probability that a photon survives the path.
+At <em>T</em> = 1 the medium is completely transparent; at <em>T</em> = 0 it is completely opaque.
+</p>
+
+<p>
+For a heterogeneous volume (density varying at each point), the law generalises to
+an integral of the extinction coefficient along the path. The raymarcher approximates
+this with a discrete sum, multiplying transmittance by a factor per step:
+</p>
+
+<pre><code><span class="kw">float</span> absorb = density * stepSz * <span class="nm">40.0</span>;   <span class="cm">// optical depth for this step</span>
+T *= <span class="fn">exp</span>(-absorb);</code></pre>
+
+<p>
+The constant <code>40.0</code> is the <strong>extinction scale</strong> — it sets how quickly
+cloud density translates into opacity. At density = 1 over a shell of thickness 0.12,
+the total optical depth is 1 x 0.12 x 40 = 4.8, giving transmittance
+e<sup>-4.8</sup> ≈ 0.008 — nearly fully opaque. The scale was chosen so that
+moderately dense clouds (density ≈ 0.3) over a default shell produce partial transparency,
+giving the characteristic layered look of cumulus from space.
+</p>
+
+<h3>Radiance accumulation</h3>
+
+<p>
+Light scattered toward the camera at each step contributes to the final pixel colour
+in proportion to the transmittance that was present <em>before</em> the step absorbed it:
+</p>
+
+<pre><code>L += T * cloudCol * absorb;</code></pre>
+
+<p>
+Reading <em>T</em> before updating it is physically correct: the light that scatters
+toward the camera at this depth must first survive all the cloud in front of it
+(already captured in the current <em>T</em>), not the additional cloud at this step.
+</p>
+
+<p>
+The final <code>gl_FragColor</code> is <code>vec4(L, 1.0 - T)</code>.
+The alpha channel is one minus the final transmittance — a fully opaque cloud
+(T → 0) gives alpha 1.0; a wispy cloud (T → 1) gives alpha 0.0.
+This value is composited over the planet frame using standard alpha blending
+with <code>depthMask(false)</code> so cloud fragments do not overwrite the planet's depth values.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 6: LIGHTMARCHING
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="light">6. Lightmarching — Self-Shadow</h2>
+
+<p>
+A cloud that ignores the density between itself and the sun looks uniformly bright —
+there is no distinction between the sunlit top surface and the shadowed underside.
+<strong>Lightmarching</strong> corrects this by tracing a secondary ray from each sample
+point toward the sun and accumulating the optical depth along that path.
+</p>
+
+<pre><code><span class="kw">float</span> <span class="fn">lightmarch</span>(<span class="kw">vec3</span> p) {
+  <span class="kw">float</span> stepSz = (u_cloudOuter - u_cloudInner) / <span class="nm">6.0</span>;
+  <span class="kw">float</span> shadow = <span class="nm">0.0</span>;
+  <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nm">0</span>; i < <span class="nm">6</span>; i++) {
+    p      += u_lightDir * stepSz;
+    shadow += <span class="fn">sceneDensityFast</span>(p) * stepSz;
+  }
+  <span class="kw">return</span> <span class="fn">exp</span>(-shadow * <span class="nm">40.0</span>);  <span class="cm">// Beer-Lambert transmittance toward sun</span>
+}</code></pre>
+
+<p>
+The march takes 6 steps (versus 64 for the primary ray), using the 3-octave
+<code>fbmFast</code> density approximation instead of the 6-octave one. Accuracy is
+traded for performance: a coarser shadow estimate is still visually correct because
+human perception of self-shadowing in clouds is forgiving.
+</p>
+
+<p>
+The return value is the fraction of sunlight that survives from the sample point
+to open sky. A value of 1 means fully lit; values near 0 mean the sample sits
+deep inside a thick cloud mass with almost no direct sun.
+</p>
+
+<h3>The shadow factor in the radiance model</h3>
+
+<p>
+The primary march multiplies the incoming sun light by the shadow factor before
+computing the cloud colour:
+</p>
+
+<pre><code><span class="kw">float</span> sunLight = <span class="fn">lightmarch</span>(p);
+<span class="kw">float</span> lum      = <span class="fn">clamp</span>(sunLight * phase, <span class="nm">0.0</span>, <span class="nm">1.0</span>);
+<span class="kw">vec3</span>  cloudCol = <span class="fn">mix</span>(<span class="kw">vec3</span>(<span class="nm">0.50</span>, <span class="nm">0.55</span>, <span class="nm">0.65</span>),  <span class="cm">// deep shadow</span>
+                      <span class="kw">vec3</span>(<span class="nm">1.00</span>, <span class="nm">0.98</span>, <span class="nm">0.95</span>),  <span class="cm">// full sunlight</span>
+                      lum);</code></pre>
+
+<p>
+The dark endpoint is a cool blue-grey (the colour of diffuse skylight in shadow);
+the bright endpoint is a warm white (direct sunlight). A cloud in full shadow
+gets the sky colour; a cloud directly illuminated gets warm white.
+The mix parameter <code>lum</code> combines both the shadow and the angular scattering
+effect described in the next section.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 7: HENYEY-GREENSTEIN
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="phase">7. The Henyey-Greenstein Phase Function</h2>
+
+<p>
+When a photon hits a water droplet in a cloud, it scatters. The probability that it
+scatters into any particular direction is given by the <strong>phase function</strong>.
+Cloud droplets — being much larger than visible-light wavelengths — scatter much more
+light forward (in the direction the photon was originally travelling) than backward.
+This is why you see a bright halo around the sun when looking through thin clouds:
+forward-scattered sunlight is aimed almost directly toward the camera.
+</p>
+
+<p>
+The <strong>Henyey-Greenstein</strong> phase function (1941) models this angular distribution
+with a single asymmetry parameter <em>g</em> ∈ (-1, 1):
+</p>
+
+<span class="eq">
+  <i>p</i>(cos θ) = (1 - <i>g</i>²) /
+  (1 + <i>g</i>² - 2<i>g</i> cos θ)<sup>3/2</sup>
+</span>
+
+<p>
+Here cos θ = <em>rd</em> · <em>lightDir</em>, the dot product between the camera ray direction
+and the sun direction. When <em>g</em> = 0 the phase is isotropic — equal scattering in
+all directions. When <em>g</em> > 0 the peak is at cos θ = 1 (ray heading toward the sun),
+producing forward scattering. At <em>g</em> = 0.65 (the value used here) the peak is
+about 39x stronger than the trough — a pronounced forward-scattering lobe.
+</p>
+
+<h3>Normalization and clamping</h3>
+
+<p>
+The analytic form is normalized to integrate to 1 over the full sphere, which makes each
+individual value very small (around 0.02-0.3). In a physically correct renderer these values
+are appropriate because they represent a probability density per steradian. Here we
+normalize the function so that side-scatter (cos θ = 0) equals 1.0, giving <em>phase</em> a
+useful range without depending on the solid angle of the sun:
+</p>
+
+<pre><code><span class="kw">float</span> <span class="fn">henyeyGreenstein</span>(<span class="kw">float</span> cosTheta, <span class="kw">float</span> g) {
+  <span class="kw">float</span> g2    = g * g;
+  <span class="kw">float</span> p     = (<span class="nm">1.0</span> - g2) / <span class="fn">pow</span>(<span class="fn">max</span>(<span class="nm">0.0001</span>, <span class="nm">1.0</span> + g2 - <span class="nm">2.0</span>*g*cosTheta), <span class="nm">1.5</span>);
+  <span class="kw">float</span> pSide = (<span class="nm">1.0</span> - g2) / <span class="fn">pow</span>(<span class="nm">1.0</span> + g2, <span class="nm">1.5</span>);   <span class="cm">// value at cosθ = 0</span>
+  <span class="kw">return</span> <span class="fn">clamp</span>(p / pSide, <span class="nm">0.0</span>, <span class="nm">3.0</span>);
+}</code></pre>
+
+<p>
+After normalization, the function ranges from about 0.4 (backscatter, looking away from sun)
+through 1.0 (side, perpendicular to sun) up to a clamped maximum of 3.0 (forward, looking
+toward sun). The clamp prevents the forward peak from blowing out to 39x — a bright halo
+effect is preserved, but the maximum brightness stays within the display range.
+</p>
+
+<table>
+  <thead><tr><th>Direction</th><th>cos θ</th><th>Phase value (g = 0.65)</th><th>Visual result</th></tr></thead>
+  <tbody>
+    <tr><td>Looking toward sun</td><td>+1.0</td><td>3.0 (clamped)</td><td>Bright corona / glory</td></tr>
+    <tr><td>Looking perpendicular</td><td>0.0</td><td>1.0 (normalised)</td><td>Neutral mid-tone</td></tr>
+    <tr><td>Looking away from sun</td><td>-1.0</td><td>≈ 0.38</td><td>Cooler, dimmer</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 8: RAY RECONSTRUCTION
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="ray">8. Ray Reconstruction from Screen Coordinates</h2>
+
+<p>
+The cloud shader runs in a fullscreen triangle — a single triangle covering the entire
+viewport with three vertices at NDC positions (-1, -1), (3, -1), and (-1, 3).
+The fragment shader receives only the NDC position <code>v_ndc</code>; it must reconstruct
+which world-space ray corresponds to this pixel without any geometric vertex data.
+</p>
+
+<h3>The forward projection pipeline</h3>
+
+<p>
+The standard rendering pipeline transforms world-space positions into screen pixels through
+three matrices in sequence:
+</p>
+
+<span class="eq">
+  <i>p</i><sub>clip</sub> = <b>P</b> · <b>V</b> · <i>p</i><sub>world</sub>
+</span>
+
+<p>
+<strong>V</strong> is the view matrix (world → camera space) and
+<strong>P</strong> is the perspective projection matrix (camera space → clip space).
+After the <em>perspective divide</em> (dividing by the w component), clip-space
+coordinates become the NDC (Normalized Device Coordinates) visible in the fragment shader.
+</p>
+
+<p>
+To go backward — from a pixel to a world-space ray — we apply the inverse matrices in reverse order.
+Both inverses are computed on the CPU each frame and uploaded as uniforms,
+since WebGL 1.0 GLSL has no built-in <code>inverse()</code> function.
+</p>
+
+<h3>Inverting the perspective matrix</h3>
+
+<p>
+The perspective matrix produced by <code>mat4Perspective</code> has a known sparse structure —
+only five entries are non-zero. Its inverse exploits this sparsity analytically:
+</p>
+
+<pre><code><span class="kw">function</span> <span class="fn">mat4InversePerspective</span>(m) {
+  <span class="kw">const</span> out = <span class="kw">new</span> Float32Array(<span class="nm">16</span>);
+  out[<span class="nm">0</span>]  =  <span class="nm">1.0</span> / m[<span class="nm">0</span>];              <span class="cm">// aspect / f</span>
+  out[<span class="nm">5</span>]  =  <span class="nm">1.0</span> / m[<span class="nm">5</span>];              <span class="cm">// 1 / f</span>
+  out[<span class="nm">11</span>] =  <span class="nm">1.0</span> / m[<span class="nm">14</span>];             <span class="cm">// row3, col2</span>
+  out[<span class="nm">14</span>] =  <span class="nm">1.0</span> / m[<span class="nm">11</span>];             <span class="cm">// = -1  (row2, col3)</span>
+  out[<span class="nm">15</span>] = -m[<span class="nm">10</span>] / (m[<span class="nm">11</span>] * m[<span class="nm">14</span>]); <span class="cm">// row3, col3</span>
+  <span class="kw">return</span> out;
+}</code></pre>
+
+<h3>Inverting the view matrix</h3>
+
+<p>
+The look-at view matrix is a rigid-body transform: a pure rotation followed by a translation.
+For any rotation matrix <strong>R</strong> (orthonormal, det = +1), its inverse equals its transpose.
+The translation part of the inverse is then -<strong>R</strong><sup>T</sup> · <em>t</em>:
+</p>
+
+<pre><code><span class="kw">function</span> <span class="fn">mat4InverseRigid</span>(m) {
+  <span class="kw">const</span> out = <span class="kw">new</span> Float32Array(<span class="nm">16</span>);
+  <span class="cm">// Transpose the 3x3 rotation block (column-major swap)</span>
+  out[<span class="nm">0</span>]=m[<span class="nm">0</span>]; out[<span class="nm">4</span>]=m[<span class="nm">1</span>]; out[<span class="nm">8</span>] =m[<span class="nm">2</span>];
+  out[<span class="nm">1</span>]=m[<span class="nm">4</span>]; out[<span class="nm">5</span>]=m[<span class="nm">5</span>]; out[<span class="nm">9</span>] =m[<span class="nm">6</span>];
+  out[<span class="nm">2</span>]=m[<span class="nm">8</span>]; out[<span class="nm">6</span>]=m[<span class="nm">9</span>]; out[<span class="nm">10</span>]=m[<span class="nm">10</span>];
+  <span class="cm">// New translation = -Rᵀ · original translation</span>
+  out[<span class="nm">12</span>]=-(m[<span class="nm">0</span>]*m[<span class="nm">12</span>]+m[<span class="nm">1</span>]*m[<span class="nm">13</span>]+m[<span class="nm">2</span>]*m[<span class="nm">14</span>]);
+  out[<span class="nm">13</span>]=-(m[<span class="nm">4</span>]*m[<span class="nm">12</span>]+m[<span class="nm">5</span>]*m[<span class="nm">13</span>]+m[<span class="nm">6</span>]*m[<span class="nm">14</span>]);
+  out[<span class="nm">14</span>]=-(m[<span class="nm">8</span>]*m[<span class="nm">12</span>]+m[<span class="nm">9</span>]*m[<span class="nm">13</span>]+m[<span class="nm">10</span>]*m[<span class="nm">14</span>]);
+  out[<span class="nm">15</span>]=<span class="nm">1.0</span>;
+  <span class="kw">return</span> out;
+}</code></pre>
+
+<h3>Reconstructing the ray in the fragment shader</h3>
+
+<p>
+With both inverse matrices available as uniforms, the fragment shader reconstructs
+the world-space ray direction in three steps:
+</p>
+
+<pre><code><span class="kw">vec3</span> <span class="fn">reconstructRayDir</span>() {
+  <span class="cm">// 1. NDC point at the far plane</span>
+  <span class="kw">vec4</span> clip    = <span class="kw">vec4</span>(v_ndc, <span class="nm">1.0</span>, <span class="nm">1.0</span>);
+
+  <span class="cm">// 2. Unproject to view (camera) space via inverse projection</span>
+  <span class="kw">vec4</span> view4   = u_invProj * clip;
+  <span class="kw">vec3</span> viewDir = view4.xyz / view4.w;  <span class="cm">// perspective divide</span>
+
+  <span class="cm">// 3. Rotate to world space via inverse view (w=0 → rotation only)</span>
+  <span class="kw">vec4</span> world4  = u_invView * <span class="kw">vec4</span>(viewDir, <span class="nm">0.0</span>);
+  <span class="kw">return</span> <span class="fn">normalize</span>(world4.xyz);
+}</code></pre>
+
+<p>
+Setting <code>w = 0.0</code> in step 3 applies only the rotation part of the
+inverse view matrix. The camera translation (the position of the eye in world space)
+is not part of the ray <em>direction</em> — it is the ray <em>origin</em>, which is
+already available as <code>u_eyePos</code>.
+</p>
+
+<div class="note">
+<strong>Why the far plane?</strong> Using <code>z = 1.0</code> (far plane in NDC) rather than
+<code>z = -1.0</code> (near plane) gives a view-space z coordinate equal to -far.
+Dividing by w (which evaluates to a small constant near 0.01) scales the XY
+components up proportionally, but after normalization the direction is identical
+regardless of which depth value is chosen.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 9: RENDER PASS
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="pass">9. The Render Pass</h2>
+
+<p>
+The cloud system adds a second WebGL program executed as a post-pass after the planet
+is drawn. It draws exactly three vertices — a single triangle — which covers the
+entire viewport. This is the <em>fullscreen triangle trick</em>: instead of a quad
+(two triangles, six vertices), one oversized triangle is sufficient and avoids the
+diagonal seam that appears in a quad under certain rasterisation rules.
+</p>
+
+<pre><code><span class="cm">// CPU: three NDC corner positions — one triangle covering the whole screen</span>
+<span class="kw">const</span> triVbo = gl.<span class="fn">createBuffer</span>();
+gl.<span class="fn">bufferData</span>(gl.ARRAY_BUFFER,
+  <span class="kw">new</span> Float32Array([-<span class="nm">1</span>,-<span class="nm">1</span>, <span class="nm">3</span>,-<span class="nm">1</span>, -<span class="nm">1</span>,<span class="nm">3</span>]),
+  gl.STATIC_DRAW);</code></pre>
+
+<h3>GL state for compositing</h3>
+
+<p>
+Clouds must blend over the opaque planet rather than replace it.
+The render pass changes three GL state flags:
+</p>
+
+<table>
+  <thead><tr><th>Flag</th><th>Planet pass</th><th>Cloud pass</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEPTH_TEST</code></td><td>on</td><td>on</td>
+        <td>Cloud triangle at NDC z = 0 is always in front; test has no effect but must stay on to preserve the planet's depth values for any subsequent passes.</td></tr>
+    <tr><td><code>depthMask</code></td><td>true</td><td><strong>false</strong></td>
+        <td>Cloud fragments must not overwrite the planet's depth values. Without this, sky pixels behind transparent cloud edges would record a depth of near-zero, breaking any future depth-dependent pass.</td></tr>
+    <tr><td><code>BLEND</code></td><td>off</td><td><strong>on</strong></td>
+        <td>Standard porter-duff over: <code>SRC_ALPHA, ONE_MINUS_SRC_ALPHA</code>. The cloud alpha (1 - transmittance) mixes the cloud radiance with the planet colour already in the framebuffer.</td></tr>
+  </tbody>
+</table>
+
+<p>
+After the cloud draw call, all three flags are restored to their planet-pass state
+so the render loop is clean for the next frame.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 10: PERFORMANCE DECISIONS
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="perf">10. Performance Decisions</h2>
+
+<p>
+Volumetric rendering is GPU-heavy. In the worst case, every pixel on screen runs
+64 primary density samples plus up to 6 x 6 shadow density samples per primary step —
+about 450 noise evaluations per pixel. Several choices reduce the practical cost.
+</p>
+
+<h3>Two noise budgets: full and fast</h3>
+
+<p>
+The primary density uses 6-octave FBM for accurate cloud structure.
+Shadow density uses 3-octave <code>fbmFast</code>. The shadow path has
+4x fewer hash evaluations per step and the coarser result is invisible to the eye,
+since humans have weak sensitivity to shadow softness inside clouds.
+This alone cuts the lightmarch cost roughly in half.
+</p>
+
+<h3>Adaptive march length</h3>
+
+<p>
+For a ray that clips only a thin sliver of the shell (grazing angle), the shell
+intersection returns a short interval and Δ<em>t</em> is tiny. The ray exits long
+before consuming all 64 steps. For a ray that plunges through the centre of the
+cloud layer, Δ<em>t</em> is larger — each step sees more density — and the
+transmittance threshold <code>T &lt; 0.01</code> typically triggers early in a
+dense cloud, aborting the remaining steps.
+</p>
+
+<h3>Planet hit as an early exit</h3>
+
+<p>
+For pixels where the ray intersects the inner sphere before the outer sphere
+(e.g., looking at the edge of the planet just above the atmosphere), the shell
+intersection sets <code>tExit = inner.x</code>, making the march interval short or zero.
+An additional in-loop check <code>if (length(p) &lt; u_cloudInner) break</code>
+provides a safety net: if a floating-point step overshoots the inner boundary,
+the loop exits rather than sampling planet-interior density.
+</p>
+
+<h3>Lightmarch only on dense steps</h3>
+
+<p>
+The 6-step shadow march is only launched when the primary density exceeds 0.001:
+</p>
+
+<pre><code><span class="kw">if</span> (density > <span class="nm">0.001</span>) {
+  <span class="kw">float</span> sunLight = <span class="fn">lightmarch</span>(p);
+  <span class="cm">// ... accumulate</span>
+}</code></pre>
+
+<p>
+In clear sky regions between cloud cells, density is exactly zero. Those steps
+take only the sphere-intersection check and one density evaluation —
+no lightmarch, no radiance accumulation. The GPU threads handling those steps
+finish early, freeing warp slots for threads still inside a cloud.
+</p>
+
+<hr style="margin:3em 0; border:none; border-top:1px solid #ccd8f0;">
+
+<p style="font-size:0.9em; color:#3070a0;">
+  <a href="index.html">&larr; Back to the planet</a>
+  &nbsp;|&nbsp;
+  <a href="blog.html">How the Planet Works</a>
+  &nbsp;|&nbsp;
+  <a href="cloud.html">How the Clouds Works</a>
+  &nbsp;|&nbsp;
+</p>
+
+</body>
+</html>

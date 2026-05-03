@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How the Planet Works — MyLittlePlanet</title>
+<link rel="stylesheet" href="css/blog_style.css">
+</head>
+<body>
+
+<a class="back-link" href="index.html">&larr; Back to the Planet</a>
+
+<h1>How the Planet Works</h1>
+<p class="subtitle">Parametric surfaces, FBM noise, domain warping, and the honest limits of vertex displacement</p>
+
+<nav>
+  <strong>Contents</strong>
+  <a href="#uvsphere">1. UV Sphere</a>
+  <a href="#cubesphere">2. Cube-Sphere</a>
+  <a href="#displacement">3. Vertex Displacement</a>
+  <a href="#fbm">4. FBM Noise</a>
+  <a href="#warp">5. Domain Warping</a>
+  <a href="#lod">6. Adaptive LOD</a>
+  <a href="#limits">7. Limits vs Ray Marching</a>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 1: UV SPHERE
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="uvsphere">1. Parametric Surfaces and the UV Sphere</h2>
+
+<p>
+A <strong>parametric surface</strong> maps a rectangle in parameter space to a surface in 3D.
+Instead of specifying points directly, you write a function
+<span class="eq"><i>P</i>(<i>u</i>, <i>v</i>) : [0,1]² → ℝ³</span>
+and then sample it on a regular grid. Every point on the surface has a unique (or near-unique)
+pair of coordinates (<i>u</i>, <i>v</i>), analogous to latitude and longitude on Earth.
+</p>
+
+<p>
+A <strong>UV sphere</strong> (also called a longitude–latitude sphere) is the simplest parametric sphere.
+Define:
+</p>
+
+<span class="eq">
+  φ = 2π·<i>u</i> &nbsp; (azimuth angle, 0 → 2π)<br>
+  θ = π·<i>v</i> &nbsp; (polar angle, 0 at north pole → π at south pole)
+</span>
+
+<span class="eq">
+  <i>P</i>(<i>u</i>,<i>v</i>) =
+  ( sin θ cos φ, &nbsp; cos θ, &nbsp; sin θ sin φ )
+</span>
+
+<p>
+The Y axis is up. At θ = 0 all φ values map to the same north-pole point (0, 1, 0),
+and at θ = π they all map to (0, -1, 0). This is the <em>pole singularity</em> —
+the UV grid degenerates at the poles, creating a "pinched" region. It produces
+slightly denser triangles near the poles and slightly stretched ones near the equator,
+but for our purposes it is perfectly usable.
+</p>
+
+<h3>Building the mesh</h3>
+
+<p>
+We divide the unit square [0,1]² into a <code>RES x RES</code> grid.
+With <code>RES = 128</code> we need <strong>(128+1) x (128+1) = 16,641 vertices</strong>
+and <strong>128 x 128 x 2 = 32,768 triangles</strong>.
+The extra row and column (hence <em>RES+1</em>, not <em>RES</em>) is the fence-post rule:
+a fence with 128 intervals needs 129 posts.
+</p>
+
+<p>
+Each vertex stores only its two UV coordinates. The vertex shader reconstructs
+the 3D position. The index buffer for one quad at row <em>i</em>, column <em>j</em> is:
+</p>
+
+<pre><code><span class="cm">// tl = top-left, tr = top-right, bl = bottom-left, br = bottom-right</span>
+tl = i * (RES+1) + j
+tr = tl + 1
+bl = (i+1) * (RES+1) + j
+br = bl + 1
+
+<span class="cm">// Two triangles, CCW winding when viewed from outside the sphere:</span>
+Triangle 1: tl → tr → bl
+Triangle 2: tr → br → bl</code></pre>
+
+<p>
+CCW (counter-clockwise) winding matters because WebGL uses it to identify front faces.
+We can verify this analytically: the cross product of the phi-direction tangent
+<span class="eq">∂<i>P</i>/∂φ = (-sin θ sin φ, 0, sin θ cos φ)</span>
+with the theta-direction tangent
+<span class="eq">∂<i>P</i>/∂θ = (cos θ cos φ, -sin θ, cos θ sin φ)</span>
+points outward from the sphere — exactly what back-face culling needs.
+</p>
+
+<div class="note">
+<strong>The seam:</strong> At <em>u</em> = 0 and <em>u</em> = 1, the φ values are 0 and 2π,
+which map to the same 3D positions. We create duplicate vertices at the seam —
+the last column shares world-space position with the first column, but has a
+different UV coordinate (u = 1 vs u = 0). This duplication is harmless and keeps
+the UV mapping seamless.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 2: CUBE-SPHERE
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="cubesphere">2. Cube-Sphere: No Poles, No Seams</h2>
+
+<p>
+The UV sphere has two structural weaknesses that matter for a terrain renderer.
+First, the triangles at the poles are tiny and the triangles at the equator are stretched —
+the mesh is not uniform.
+Second, the finite-difference normal computation breaks at the poles, where all
+φ values collapse to the same 3D point and the derivative ∂<i>P</i>/∂φ → 0.
+</p>
+
+<p>
+The <strong>cube-sphere</strong> fixes both problems.
+Start from a cube: six faces, each a regular grid of quads.
+Normalize every vertex position (divide by its length), projecting it onto the unit sphere.
+The result is a sphere whose triangle density varies by at most ~27% across the surface —
+far more uniform than a UV sphere.
+</p>
+
+<span class="eq">
+  <b>P</b><sub>sphere</sub> = <b>P</b><sub>cube</sub> / |<b>P</b><sub>cube</sub>|
+</span>
+
+<h3>Building the six faces</h3>
+
+<p>
+Each face is described by three orthogonal unit vectors: <em>fwd</em> (the outward-facing
+normal of the cube face), <em>r</em> (right across the face), and <em>u</em> (up across the face).
+A parameter pair (<em>s</em>, <em>t</em>) ∈ [-1, 1]² sweeps the face:
+</p>
+
+<pre><code>P<sub>cube</sub>(s, t) = fwd + r·s + u·t</code></pre>
+
+<p>
+After normalization these six patches tile the sphere without gaps or overlaps.
+The right and up vectors for each face are chosen so that <code>cross(r, u) = fwd</code>,
+ensuring counter-clockwise triangle winding when viewed from outside the sphere.
+</p>
+
+<table>
+  <thead><tr><th>Face</th><th>fwd</th><th>r (right)</th><th>u (up)</th></tr></thead>
+  <tbody>
+    <tr><td>+X</td><td>(1, 0, 0)</td><td>(0, 0, -1)</td><td>(0, 1, 0)</td></tr>
+    <tr><td>-X</td><td>(-1, 0, 0)</td><td>(0, 0, 1)</td><td>(0, 1, 0)</td></tr>
+    <tr><td>+Y (top)</td><td>(0, 1, 0)</td><td>(1, 0, 0)</td><td>(0, 0, -1)</td></tr>
+    <tr><td>-Y (bottom)</td><td>(0, -1, 0)</td><td>(1, 0, 0)</td><td>(0, 0, 1)</td></tr>
+    <tr><td>+Z</td><td>(0, 0, 1)</td><td>(1, 0, 0)</td><td>(0, 1, 0)</td></tr>
+    <tr><td>-Z</td><td>(0, 0, -1)</td><td>(-1, 0, 0)</td><td>(0, 1, 0)</td></tr>
+  </tbody>
+</table>
+
+<h3>The <code>a_dir</code> vertex attribute</h3>
+
+<p>
+Instead of UV coordinates, each vertex stores its <em>unnormalized</em>
+cube direction as a <code>vec3</code> attribute (<code>a_dir</code>).
+The vertex shader normalizes it to get the sphere point:
+</p>
+
+<pre><code><span class="kw">vec3</span> n0 = <span class="fn">normalize</span>(a_dir);</code></pre>
+
+<p>
+This is more natural than a UV parameterization because the noise functions already
+operate in 3D space — no trigonometry needed to convert (u, v) to a 3D sample position.
+</p>
+
+<h3>The Duff 2017 tangent frame</h3>
+
+<p>
+The UV sphere's finite-difference normals were computed by offsetting in UV directions
+(Δφ, Δθ). The cube-sphere has no UV parameterization, so offsets must instead be taken
+in the <strong>sphere-tangent plane</strong>.
+Given a sphere point <em>n</em>, we need two orthogonal tangent vectors <em>t</em> and <em>b</em>
+such that <code>cross(t, b) = n</code> (outward normal convention).
+The classic construction <code>t = cross(n, worldUp)</code> breaks whenever <em>n</em>
+is nearly parallel to worldUp.
+The <strong>Duff 2017</strong> method is singularity-free everywhere on the sphere:
+</p>
+
+<pre><code><span class="kw">void</span> <span class="fn">duffFrame</span>(vec3 n, <span class="kw">out</span> vec3 t, <span class="kw">out</span> vec3 b) {
+  <span class="kw">float</span> s = (n.z >= <span class="nm">0.0</span>) ? <span class="nm">1.0</span> : -<span class="nm">1.0</span>;
+  <span class="kw">float</span> a = -<span class="nm">1.0</span> / (s + n.z);
+  <span class="kw">float</span> c = n.x * n.y * a;
+  t = vec3(<span class="nm">1.0</span> + s*n.x*n.x*a,  s*c,  -s*n.x);
+  b = vec3(c,  s + n.y*n.y*a,  -n.y);
+}</code></pre>
+
+<p>
+The sign variable <em>s</em> selects a branch per hemisphere.
+Neither branch can produce a zero denominator: when <em>s</em> = +1 we need
+<em>n.z</em> ≠ -1 (which is the south pole of the <em>z</em>-axis, impossible since
+<em>s</em> = +1 only when <em>n.z</em> ≥ 0), and vice versa for <em>s</em> = -1.
+</p>
+
+<p>
+With the tangent frame, finite-difference normals become a straightforward world-space computation:
+</p>
+
+<pre><code><span class="cm">// Offset sphere points (re-normalize to stay on unit sphere)</span>
+vec3 nt = <span class="fn">normalize</span>(n0 + EPS * t);
+vec3 nb = <span class="fn">normalize</span>(n0 + EPS * b);
+
+<span class="cm">// Displaced world positions</span>
+vec3 d0 = (radius + <span class="fn">displace</span>(n0)) * n0;
+vec3 dt = (radius + <span class="fn">displace</span>(nt)) * nt;
+vec3 db = (radius + <span class="fn">displace</span>(nb)) * nb;
+
+<span class="cm">// Outward surface normal</span>
+vec3 N = <span class="fn">normalize</span>(<span class="fn">cross</span>(dt - d0, db - d0));</code></pre>
+
+<div class="note">
+<strong>Index buffer safety:</strong> WebGL 1 index buffers are 16-bit
+(<code>Uint16Array</code>, max index 65&thinsp;535).
+A 128x128 face patch has (128+1)² = 16&thinsp;641 vertices — safe.
+The renderer issues <strong>six separate draw calls</strong> (one per face),
+so each call's maximum index stays well below 65&thinsp;535 at every resolution.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 3: VERTEX DISPLACEMENT
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="displacement">3. Vertex Displacement</h2>
+
+<p>
+Once we have a smooth sphere, we want mountains and valleys.
+The key idea is simple: instead of rendering the sphere at radius <em>r</em>,
+move each vertex outward (or inward) by a height value <em>h</em> derived from a noise function:
+</p>
+
+<span class="eq">
+  <i>P</i><sub>displaced</sub>(<i>u</i>, <i>v</i>) =
+  (<i>r</i> + <i>h</i>(<i>P̂</i>)) · <i>P̂</i>(<i>u</i>, <i>v</i>)
+</span>
+
+<p>
+where <em>P̂</em> is the <em>unit</em> sphere point (radius 1).
+The displacement <em>h</em> is evaluated at the undisplaced sphere surface, not
+at the displaced position, so there is no feedback loop.
+</p>
+
+<p>
+This gives genuine 3D terrain because the vertices physically move — unlike
+a normal map or parallax mapping technique which only <em>simulates</em> depth
+via shading tricks without changing geometry.
+</p>
+
+<h3>Recomputing normals</h3>
+
+<p>
+After displacement the sphere surface has changed shape, so its normals have changed too.
+If we kept the original sphere normals, mountains would be lit as if they were smooth bumps.
+We need the normals of the <em>displaced</em> surface.
+</p>
+
+<p>
+The cleanest approach is <strong>finite differences</strong>:
+sample the displacement at three nearby UV positions and approximate the tangent vectors:
+</p>
+
+<pre><code>vec3 p0 = spherePt(u,       v);      <span class="cm">// centre sample</span>
+vec3 pu = spherePt(u + eps, v);      <span class="cm">// offset in φ direction</span>
+vec3 pv = spherePt(u,       v + eps);<span class="cm">// offset in θ direction</span>
+
+vec3 d0  = (radius + <span class="fn">displace</span>(p0)) * p0;
+vec3 dpu = (radius + <span class="fn">displace</span>(pu)) * pu;
+vec3 dpv = (radius + <span class="fn">displace</span>(pv)) * pv;
+
+<span class="cm">// Surface tangents → outward normal</span>
+vec3 N = <span class="fn">normalize</span>(<span class="fn">cross</span>(dpu - d0, dpv - d0));</code></pre>
+
+<p>
+The epsilon <code>eps = 0.003</code> is in UV space, corresponding to about 0.6° of arc on the sphere.
+Too small and floating-point noise dominates; too large and the derivative approximation
+is crude. For the noise frequencies used here, 0.003 gives accurate normals.
+</p>
+
+<div class="warn">
+<strong>Pole singularity:</strong> At <em>v</em> = 0 or <em>v</em> = 1, all φ values map to the
+same 3D point, so <code>dpu - d0 → 0</code> and <code>cross(…)</code> becomes undefined.
+The fix is simple: clamp <em>v</em> to [2·eps, 1 - 2·eps] when sampling for finite differences.
+The pole vertices are still rendered at their correct positions; only the derivative
+samples are clamped.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 3: FBM NOISE
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="fbm">4. FBM Noise</h2>
+
+<p>
+Plain random noise produces a rough, salt-and-pepper pattern with no large-scale structure.
+Real terrain has features at every scale simultaneously: continental plains, mountain ranges,
+hills, boulders. <strong>Fractional Brownian Motion (FBM)</strong> achieves this by
+summing multiple octaves of noise at increasing frequencies and decreasing amplitudes.
+</p>
+
+<h3>Value noise</h3>
+
+<p>
+The building block is <strong>value noise</strong>:
+</p>
+<ol style="margin:0.6em 0 0.6em 1.5em; line-height:1.9">
+  <li>Evaluate a hash function at each corner of the integer lattice cube containing <em>P</em>.</li>
+  <li>Trilinearly interpolate the eight corner values using a smooth kernel.</li>
+</ol>
+
+<p>
+We use the <strong>quintic smoothstep</strong> <span class="eq">6t⁵ - 15t⁴ + 10t³</span>
+as the interpolation curve. It has zero first <em>and</em> second derivatives at the
+lattice boundaries, giving C² continuity — smoother than the classic cubic 3t² - 2t³
+and free of the derivative discontinuity that shows up as shading "creases" on curved surfaces.
+</p>
+
+<p>
+For the hash function we use the <em>Dave Hoskins</em> approach:
+</p>
+
+<pre><code><span class="kw">float</span> <span class="fn">hash3</span>(vec3 p) {
+  p  = <span class="fn">fract</span>(p * <span class="nm">0.3183099</span> + vec3(<span class="nm">0.1</span>));
+  p *= <span class="nm">17.0</span>;
+  <span class="kw">return</span> <span class="fn">fract</span>(p.x * p.y * p.z * (p.x + p.y + p.z));
+}</code></pre>
+
+<p>
+This avoids <code>sin()</code>, which has documented precision issues as a hash function
+on some GPU drivers (the mantissa bits cycle rather than appear random at large inputs).
+</p>
+
+<h3>Layering octaves</h3>
+
+<p>
+FBM accumulates <em>N</em> octaves, each contributing noise at a different scale:
+</p>
+
+<span class="eq">
+  FBM(<i>p</i>) = Σ<sub><i>k</i>=0</sub><sup><i>N</i>-1</sup> gain<sup><i>k</i></sup> · noise( <i>p</i> · lacunarity<sup><i>k</i></sup> )
+</span>
+
+<p>
+<strong>Lacunarity</strong> (typically 2.0) multiplies the frequency per octave —
+each layer sees features twice as fine as the previous.
+<strong>Gain</strong> (typically 0.5) multiplies the amplitude per octave —
+fine details contribute less than broad shapes.
+Together, the amplitude halves every time the frequency doubles, producing
+the same statistical self-similarity as a Brownian surface (fractal dimension ≈ 2).
+</p>
+
+<table>
+  <thead><tr><th>Octave</th><th>Relative frequency</th><th>Relative amplitude (gain=0.5)</th><th>Feature size</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>1x</td><td>0.500</td><td>continents</td></tr>
+    <tr><td>1</td><td>2x</td><td>0.250</td><td>mountain ranges</td></tr>
+    <tr><td>2</td><td>4x</td><td>0.125</td><td>large hills</td></tr>
+    <tr><td>3</td><td>8x</td><td>0.063</td><td>small hills</td></tr>
+    <tr><td>4</td><td>16x</td><td>0.031</td><td>rocks</td></tr>
+    <tr><td>5</td><td>32x</td><td>0.016</td><td>surface texture</td></tr>
+  </tbody>
+</table>
+
+<p>
+We normalize the output by dividing by the sum of all amplitudes (the denominator converges
+to <em>A</em><sub>0</sub> / (1 - gain) = 1 for gain = 0.5, A₀ = 0.5).
+This keeps FBM in [-1, 1] regardless of the number of octaves.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 4: DOMAIN WARPING
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="warp">5. Domain Warping</h2>
+
+<p>
+Plain FBM produces terrain that looks geologically <em>correct</em> but compositionally
+<em>bland</em> — the features are statistically isotropic and lack the elongated ridges,
+sinuous valleys, and swirling patterns seen in real planetary geology.
+<strong>Domain warping</strong> (introduced by Inigo Quilez) fixes this by
+distorting the input coordinate before querying the noise.
+</p>
+
+<h3>How it works</h3>
+
+<p>
+Instead of evaluating <code>fbm(p)</code> directly, we evaluate it at a perturbed position
+<em>p + offset</em>, where the offset is itself computed from FBM. The result is
+a noise field that has been "folded" over itself:
+</p>
+
+<pre><code><span class="cm">// Single-level warp</span>
+vec3 q = vec3(
+  <span class="fn">fbm</span>(p * warpFreq),
+  <span class="fn">fbm</span>(p * warpFreq + <span class="nm">5.2</span>),
+  <span class="fn">fbm</span>(p * warpFreq + <span class="nm">1.3</span>)
+);
+<span class="kw">float</span> result = <span class="fn">fbm</span>(p + warpStrength * q);</code></pre>
+
+<p>
+We use <strong>two levels</strong> of warping: a second offset vector <em>r</em>
+is computed from the <em>q</em>-warped position, then the main FBM is sampled at
+<em>p + warpStrength · r</em>. Two-level warping creates more complex folded structures —
+overhanging ridges, tightly wound spirals, and the kind of organic complexity that
+single-level warping can't produce.
+</p>
+
+<p>
+The scalar offsets (<code>5.2</code>, <code>1.7</code>, <code>9.2</code>, …) shift the
+three vector channels to different regions of noise space, preventing them from being
+correlated. Without these offsets, all three channels would produce similar values
+and the warp would be nearly isotropic — no different from no warp at all.
+</p>
+
+<h3>What the parameters control</h3>
+
+<table>
+  <thead><tr><th>Parameter</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>warpStrength</code></td>
+        <td>How far the coordinate is displaced before sampling. 0 = no warp (pure FBM). Large values create extreme folded patterns and can distort the terrain beyond recognition.</td></tr>
+    <tr><td><code>warpFreq</code></td>
+        <td>Frequency of the warp noise itself. Low values = large, sweeping bends. High values = rapid, tight swirls.</td></tr>
+    <tr><td><code>warpOctaves</code></td>
+        <td>Detail in the warp itself. More octaves = the warp has fine structure on top of its large-scale structure.</td></tr>
+  </tbody>
+</table>
+
+<h3>Why it can't produce real overhangs</h3>
+
+<p>
+The terrain is still defined as a single-valued function on the sphere surface —
+one height <em>h</em> per point (<em>u</em>, <em>v</em>). Domain warping makes the
+<em>noise field</em> more complex, but the surface is still a single-layer shell.
+If the warp is strong enough, two nearby surface points might have very similar or
+even identical heights, which looks like a cliff — but there is no material behind
+the cliff face, no overhang, no cave.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 6: ADAPTIVE LOD
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="lod">6. Adaptive Level of Detail</h2>
+
+<p>
+A 128x128 mesh looks smooth from a distance of 5 units.
+Zoom in to 1.5 units and the same mesh shows visible faceting —
+flat polygons where smooth terrain should be.
+Zoom out to 8 units and most triangles are sub-pixel, wasting GPU time.
+<strong>Level of detail (LOD)</strong> solves both ends of this problem
+by switching between mesh resolutions according to camera distance.
+</p>
+
+<h3>Pre-built resolution levels</h3>
+
+<p>
+This renderer pre-allocates four cube-sphere meshes at startup, one for each LOD level:
+</p>
+
+<table>
+  <thead><tr><th>Level</th><th>Resolution</th><th>Triangles/face</th><th>Total triangles</th><th>Active when distance ≤</th></tr></thead>
+  <tbody>
+    <tr><td>0 (finest)</td><td>128x128</td><td>32,768</td><td>196,608</td><td>2.0</td></tr>
+    <tr><td>1</td><td>64x64</td><td>8,192</td><td>49,152</td><td>3.5</td></tr>
+    <tr><td>2</td><td>32x32</td><td>2,048</td><td>12,288</td><td>6.0</td></tr>
+    <tr><td>3 (coarsest)</td><td>16x16</td><td>512</td><td>3,072</td><td>∞</td></tr>
+  </tbody>
+</table>
+
+<p>
+Each level's vertex buffer (<code>dirData</code>) and index buffer are uploaded to GPU
+memory once during initialization as <code>gl.STATIC_DRAW</code> — 24 VBOs and 24 IBOs
+in total, a few megabytes of VRAM at most.
+The data for all levels is immediately available every frame; no CPU upload occurs
+during rendering.
+</p>
+
+<h3>Distance-based selection</h3>
+
+<p>
+Each frame, the renderer reads the camera distance and picks the finest applicable level:
+</p>
+
+<pre><code><span class="kw">function</span> <span class="fn">getLODIndex</span>(dist) {
+  <span class="kw">for</span> (<span class="kw">let</span> i = <span class="nm">0</span>; i &lt; LOD_LEVELS.length; i++) {
+    <span class="kw">if</span> (dist &lt;= LOD_LEVELS[i].maxDist) <span class="kw">return</span> i;
+  }
+  <span class="kw">return</span> LOD_LEVELS.length - <span class="nm">1</span>;
+}</code></pre>
+
+<p>
+The HUD displays the active level alongside the FPS counter
+(<code>FPS: 60 | LOD: 64</code>).
+Zoom in past distance 3.5 and the counter immediately shows <code>LOD: 128</code> —
+the switch is free because both meshes are already on the GPU.
+</p>
+
+<h3>Why not per-face LOD?</h3>
+
+<p>
+A more sophisticated approach assigns a different resolution to each of the six
+cube faces based on its distance from the camera.
+The face closest to the camera gets the finest mesh; the face on the far side of
+the planet gets the coarsest.
+</p>
+
+<p>
+This renderer keeps all six faces at the same level for simplicity — when viewing
+the whole planet, the error of under-tessellating a distant face is not visible.
+Per-face LOD becomes worthwhile only when the camera flies into the atmosphere,
+where some faces are very close and others are behind the visual horizon.
+</p>
+
+<div class="note">
+<strong>LOD seams:</strong> When adjacent patches have different resolutions,
+cracks appear at their shared edges because the fine mesh has vertices that the
+coarse mesh does not.
+Because all six faces share the same resolution here, no seam stitching is required.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 7: LIMITS VS RAY MARCHING
+     ═══════════════════════════════════════════════════════ -->
+<h2 id="limits">7. Limitations vs True Ray-Marched Caves</h2>
+
+<p>
+The technique we use — vertex displacement on a sphere mesh — is excellent for
+real-time rendering and is what most game planet renderers do.
+But it has a fundamental topological constraint:
+</p>
+
+<div class="warn">
+<strong>Displacement mapping cannot produce overhangs, tunnels, or caves.</strong><br>
+The sphere mesh is a topological sphere — it has no holes. Every direction from
+the centre intersects the surface exactly once. No amount of vertex displacement
+can change this topology.
+</div>
+
+
+<hr style="margin:3em 0; border:none; border-top:1px solid #d0d0e8;">
+
+<p style="font-size:0.9em; color:#5560a0;">
+  <a href="index.html">&larr; Back to the planet</a>
+  &nbsp;|&nbsp;
+  <a href="cloud.html">How the Clouds Work &rarr;</a>
+  &nbsp;|&nbsp;
+  <a href="IDEAS.md">IDEAS.md — extension roadmap</a>
+  &nbsp;|&nbsp;
+  <a href="README.md">README.md</a>
+</p>
+
+</body>
+</html>
